@@ -23,9 +23,8 @@ from config import settings
 from database import init_db, AsyncSessionLocal
 from models import OpportunityOut
 from routers import opportunities, trades, portfolio, settings as settings_router
-from services import polymarket
+from services import kalshi, paper_trading, polymarket
 from services.detector import detect_opportunities
-from services import paper_trading
 from state import app_state
 
 logging.basicConfig(level=logging.INFO)
@@ -88,7 +87,10 @@ async def poll_loop():
 
 async def _run_poll_cycle():
     # 1. Fetch market data
-    contracts = await polymarket.fetch_markets()
+    poly_task = asyncio.create_task(polymarket.fetch_markets())
+    kalshi_task = asyncio.create_task(kalshi.fetch_markets())
+    poly_contracts, kalshi_contracts = await asyncio.gather(poly_task, kalshi_task)
+    contracts = poly_contracts + kalshi_contracts
 
     # 2. Mark stale
     from services.polymarket import mark_stale
@@ -108,7 +110,8 @@ async def _run_poll_cycle():
         )
 
     # 6. Build broadcast payload
-    venue_status = polymarket.get_venue_status()
+    poly_status = polymarket.get_venue_status()
+    kalshi_status = kalshi.get_venue_status()
     payload = {
         "type": "update",
         "data": {
@@ -118,12 +121,19 @@ async def _run_poll_cycle():
             ],
             "venue_status": {
                 "polymarket": {
-                    "connected": venue_status.connected,
-                    "last_update": venue_status.last_update,
-                    "stale": venue_status.stale,
-                    "market_count": venue_status.market_count,
-                    "error": venue_status.error,
-                }
+                    "connected": poly_status.connected,
+                    "last_update": poly_status.last_update,
+                    "stale": poly_status.stale,
+                    "market_count": poly_status.market_count,
+                    "error": poly_status.error,
+                },
+                "kalshi": {
+                    "connected": kalshi_status.connected,
+                    "last_update": kalshi_status.last_update,
+                    "stale": kalshi_status.stale,
+                    "market_count": kalshi_status.market_count,
+                    "error": kalshi_status.error,
+                },
             },
             "portfolio": portfolio_summary,
         },
@@ -173,16 +183,24 @@ app.include_router(settings_router.router)
 
 @app.get("/api/status")
 async def status():
-    vs = polymarket.get_venue_status()
+    poly_status = polymarket.get_venue_status()
+    kalshi_status = kalshi.get_venue_status()
     return {
         "venue_status": {
             "polymarket": {
-                "connected": vs.connected,
-                "last_update": vs.last_update,
-                "stale": vs.stale,
-                "market_count": vs.market_count,
-                "error": vs.error,
-            }
+                "connected": poly_status.connected,
+                "last_update": poly_status.last_update,
+                "stale": poly_status.stale,
+                "market_count": poly_status.market_count,
+                "error": poly_status.error,
+            },
+            "kalshi": {
+                "connected": kalshi_status.connected,
+                "last_update": kalshi_status.last_update,
+                "stale": kalshi_status.stale,
+                "market_count": kalshi_status.market_count,
+                "error": kalshi_status.error,
+            },
         },
         "opportunity_count": len(app_state.opportunities),
     }
@@ -198,7 +216,8 @@ async def websocket_endpoint(ws: WebSocket):
                 portfolio_summary = await paper_trading.get_portfolio_summary(
                     db, app_state.contracts_by_token
                 )
-            vs = polymarket.get_venue_status()
+            poly_status = polymarket.get_venue_status()
+            kalshi_status = kalshi.get_venue_status()
             await ws.send_text(
                 json.dumps(
                     {
@@ -210,12 +229,19 @@ async def websocket_endpoint(ws: WebSocket):
                             ],
                             "venue_status": {
                                 "polymarket": {
-                                    "connected": vs.connected,
-                                    "last_update": vs.last_update,
-                                    "stale": vs.stale,
-                                    "market_count": vs.market_count,
-                                    "error": vs.error,
-                                }
+                                    "connected": poly_status.connected,
+                                    "last_update": poly_status.last_update,
+                                    "stale": poly_status.stale,
+                                    "market_count": poly_status.market_count,
+                                    "error": poly_status.error,
+                                },
+                                "kalshi": {
+                                    "connected": kalshi_status.connected,
+                                    "last_update": kalshi_status.last_update,
+                                    "stale": kalshi_status.stale,
+                                    "market_count": kalshi_status.market_count,
+                                    "error": kalshi_status.error,
+                                },
                             },
                             "portfolio": portfolio_summary,
                         },

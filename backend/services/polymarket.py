@@ -2,12 +2,12 @@
 Polymarket API client.
 
 Strategy:
-  1. negRisk events  – fetch ALL active negRisk events from Gamma /events.
+  1. negRisk events  - fetch ALL active negRisk events from Gamma /events.
      Each event groups mutually-exclusive binary markets (e.g. "Who wins the
      Stanley Cup?").  We extract the YES token from every market in the event
      and check Σ ask(YES_i) < 1.0 for event-group arb.
 
-  2. Binary markets  – small set of the *least-competitive* binary markets
+  2. Binary markets  - small set of the *least-competitive* binary markets
      (competitive score ascending) where intra-market arb is theoretically
      possible (ask_YES + ask_NO < 1.0).  High-volume markets are always
      efficiently priced at ~1.001 so we skip them.
@@ -19,6 +19,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 from datetime import datetime
 from typing import Optional
 
@@ -38,6 +39,10 @@ _venue_status = VenueStatus(
 
 # Hard cap on binary markets to scan (they rarely have arb; save CLOB budget)
 _BINARY_MARKET_CAP = 100
+_TEMPORAL_LADDER_SPLIT_RE = re.compile(
+    r"\b(on or before|at or before|before|by)\b",
+    re.IGNORECASE,
+)
 
 
 def get_venue_status() -> VenueStatus:
@@ -159,6 +164,11 @@ def _parse_neg_risk_events(raw_events: list[dict]) -> list[NormalizedContract]:
     contracts: list[NormalizedContract] = []
 
     for event in raw_events:
+        # Gamma's negRisk query filter is not reliable by itself.
+        # Keep only events explicitly flagged as negRisk/exclusive.
+        if not event.get("negRisk"):
+            continue
+
         event_id = str(event.get("id") or event.get("slug", ""))
         if not event_id:
             continue
@@ -166,13 +176,29 @@ def _parse_neg_risk_events(raw_events: list[dict]) -> list[NormalizedContract]:
         event_title = event.get("title") or event.get("question") or "Unknown Event"
         markets = event.get("markets") or []
 
-        # Keep only markets that are actively accepting orders
-        active = [
-            m for m in markets
-            if m.get("acceptingOrders") and not m.get("closed")
-        ]
+        # Keep only open markets that are tradable and explicitly negRisk.
+        active = []
+        for m in markets:
+            if m.get("closed"):
+                continue
+            if not m.get("acceptingOrders"):
+                continue
+            if m.get("negRisk") is False:
+                continue
+            active.append(m)
+
         if len(active) < 2:
             continue  # need at least 2 outcomes for event-group arb
+
+        # Temporal ladders ("by Jan", "by Feb", "by Mar") are overlapping YES
+        # predicates and cannot be treated as a guaranteed one-pays-$1 basket.
+        if _is_temporal_ladder(active):
+            logger.info(
+                "Skipping overlapping temporal ladder event: %s (%s)",
+                event_title,
+                event_id,
+            )
+            continue
 
         for m in active:
             market_id = m.get("conditionId") or m.get("id", "")
@@ -221,6 +247,38 @@ def _parse_neg_risk_events(raw_events: list[dict]) -> list[NormalizedContract]:
             )
 
     return contracts
+
+
+def _is_temporal_ladder(markets: list[dict]) -> bool:
+    """
+    Detect overlapping time-threshold market sets like:
+      "Will X happen by Jan 31?"
+      "Will X happen by Feb 28?"
+    These YES outcomes can resolve true simultaneously.
+    """
+    stems: list[str] = []
+    for m in markets:
+        question = (m.get("question") or m.get("title") or "").strip()
+        if not question:
+            return False
+        stem = _extract_temporal_stem(question)
+        if stem is None:
+            return False
+        stems.append(stem)
+
+    return len(stems) >= 2 and len(set(stems)) == 1
+
+
+def _extract_temporal_stem(question: str) -> Optional[str]:
+    q = " ".join(question.lower().split()).strip(" ?")
+    match = _TEMPORAL_LADDER_SPLIT_RE.search(q)
+    if match is None:
+        return None
+
+    stem = q[:match.start()].strip()
+    if stem.startswith("will "):
+        stem = stem[5:].strip()
+    return stem or None
 
 
 # ─── Binary market pipeline ────────────────────────────────────────────────────

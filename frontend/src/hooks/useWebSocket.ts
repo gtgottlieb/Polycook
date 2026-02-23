@@ -17,6 +17,13 @@ const DEFAULT_VENUE_STATUS: VenueStatusMap = {
     market_count: 0,
     error: null,
   },
+  kalshi: {
+    connected: false,
+    last_update: null,
+    stale: true,
+    market_count: 0,
+    error: null,
+  },
 };
 
 export function useWebSocket(): LiveState {

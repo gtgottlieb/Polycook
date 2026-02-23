@@ -20,6 +20,7 @@ class Settings(BaseSettings):
     # API
     gamma_base_url: str = "https://gamma-api.polymarket.com"
     clob_base_url: str = "https://clob.polymarket.com"
+    kalshi_base_url: str = "https://api.elections.kalshi.com/trade-api/v2"
     clob_books_batch_size: int = 400  # tokens per /books POST
 
     class Config:

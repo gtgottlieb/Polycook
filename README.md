@@ -9,6 +9,8 @@ A live arbitrage scanner that continuously detects Polymarket intra-market mispr
 ## Features (v0)
 
 - **Live Arbitrage Scanner** - detects when `ask(YES) + ask(NO) < 1.0` on Polymarket binary markets, and `Σ ask(i) < 1.0` for multi-outcome markets
+- **Kalshi Integration** - ingests open Kalshi YES/NO markets each cycle
+- **Cross-Platform Arb Checks** - checks `ask(YES @ Venue A) + ask(NO @ Venue B) < 1.0` for matched markets across venues
 - **Real-time Updates** - WebSocket push from backend on every poll cycle
 - **Paper Trading** - simulate entering and closing arbitrage positions with locked-in profit tracking
 - **Live P&L** - positions marked to market continuously with live bid prices
@@ -40,7 +42,7 @@ pip install -r requirements.txt
 uvicorn main:app --reload --port 8000
 ```
 
-The backend starts polling Polymarket immediately. SQLite database is created at `backend/data/polycook.db`.
+The backend starts polling Polymarket and Kalshi immediately. SQLite database is created at `backend/data/polycook.db`.
 
 ### Frontend
 
