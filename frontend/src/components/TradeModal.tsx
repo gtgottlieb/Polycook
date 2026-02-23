@@ -49,11 +49,16 @@ export default function TradeModal({ opportunity, onClose, onSuccess }: Props) {
           {/* Leg summary */}
           <div className="bg-surface-2 rounded p-3 space-y-1">
             {opp.legs.map((leg) => (
-              <div key={leg.outcome_id} className="flex justify-between text-xs">
-                <span className="text-slate-400">
-                  Buy {leg.label} ({leg.venue})
-                </span>
-                <span className="text-white">@ {leg.ask.toFixed(4)}</span>
+              <div key={leg.outcome_id} className="text-xs">
+                <div className="flex justify-between gap-3">
+                  <span className="text-slate-400">
+                    Buy {leg.label} ({leg.venue})
+                  </span>
+                  <span className="text-white shrink-0">@ {leg.ask.toFixed(4)}</span>
+                </div>
+                <p className="text-slate-300 mt-0.5 truncate" title={leg.market_title}>
+                  {leg.market_title}
+                </p>
               </div>
             ))}
             <div className="border-t border-surface-3 pt-1 mt-1 flex justify-between text-xs font-medium">

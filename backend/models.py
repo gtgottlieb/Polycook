@@ -62,6 +62,8 @@ class NormalizedContract(BaseModel):
     updated_at: datetime
     market_title: str
     is_stale: bool = False
+    event_id: Optional[str] = None    # negRisk event ID (set for event-group YES legs)
+    event_title: Optional[str] = None  # e.g. "2026 FIFA World Cup Winner"
 
 
 class TradeLeg(BaseModel):
@@ -78,6 +80,7 @@ class TradeLeg(BaseModel):
 class OpportunityLeg(BaseModel):
     outcome_id: str
     market_id: str
+    market_title: str
     label: str
     venue: str = "polymarket"
     ask: float

@@ -55,10 +55,15 @@ export default function OpportunityDetail({ opportunity, onTrade, onClose }: Pro
           </h3>
           <div className="space-y-2">
             {opp.legs.map((leg) => (
-              <div key={leg.outcome_id} className="flex items-center justify-between text-xs">
-                <div className="flex items-center gap-2">
-                  <span className="badge bg-surface-2 text-slate-300">{leg.label}</span>
-                  <span className="text-slate-400 capitalize">{leg.venue}</span>
+              <div key={leg.outcome_id} className="flex items-center justify-between text-xs gap-3">
+                <div className="min-w-0">
+                  <div className="flex items-center gap-2">
+                    <span className="badge bg-surface-2 text-slate-300">{leg.label}</span>
+                    <span className="text-slate-400 capitalize">{leg.venue}</span>
+                  </div>
+                  <p className="text-slate-300 mt-1 truncate" title={leg.market_title}>
+                    {leg.market_title}
+                  </p>
                 </div>
                 <div className="flex items-center gap-4 text-right">
                   <div>

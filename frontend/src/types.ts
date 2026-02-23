@@ -3,6 +3,7 @@
 export interface OpportunityLeg {
   outcome_id: string;
   market_id: string;
+  market_title: string;
   label: string;
   venue: string;
   ask: number;
