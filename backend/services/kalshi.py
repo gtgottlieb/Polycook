@@ -9,6 +9,7 @@ from __future__ import annotations
 import logging
 from datetime import datetime
 from typing import Optional
+from urllib.parse import quote
 
 import aiohttp
 
@@ -24,7 +25,7 @@ _venue_status = VenueStatus(
     market_count=0,
 )
 
-_KALSHI_MARKET_CAP = 800
+_KALSHI_MARKET_CAP = 2000
 
 
 def get_venue_status() -> VenueStatus:
@@ -38,7 +39,7 @@ async def fetch_markets() -> list[NormalizedContract]:
     global _venue_status
     try:
         async with aiohttp.ClientSession(
-            timeout=aiohttp.ClientTimeout(total=30)
+            timeout=aiohttp.ClientTimeout(total=60)
         ) as session:
             raw_markets = await _fetch_kalshi_markets(session)
             contracts = _parse_kalshi_markets(raw_markets)
@@ -109,6 +110,7 @@ def _parse_kalshi_markets(raw_markets: list[dict]) -> list[NormalizedContract]:
         market_id = m.get("ticker")
         if not market_id:
             continue
+        event_ticker = str(m.get("event_ticker") or "").strip()
 
         title = (m.get("title") or m.get("subtitle") or market_id).strip()
         close_time = _parse_dt(
@@ -133,8 +135,13 @@ def _parse_kalshi_markets(raw_markets: list[dict]) -> list[NormalizedContract]:
 
         if yes_bid is None and yes_ask is None and no_bid is None and no_ask is None:
             continue
-        if size_hint is None:
-            size_hint = 1.0
+        if size_hint is None or size_hint < settings.min_max_size:
+            continue
+
+        market_url = _build_market_url(
+            event_ticker=event_ticker or None,
+            market_id=market_id,
+        )
 
         contracts.append(
             NormalizedContract(
@@ -149,6 +156,7 @@ def _parse_kalshi_markets(raw_markets: list[dict]) -> list[NormalizedContract]:
                 close_time=close_time,
                 updated_at=now,
                 market_title=title,
+                market_url=market_url,
             )
         )
         contracts.append(
@@ -164,6 +172,7 @@ def _parse_kalshi_markets(raw_markets: list[dict]) -> list[NormalizedContract]:
                 close_time=close_time,
                 updated_at=now,
                 market_title=title,
+                market_url=market_url,
             )
         )
 
@@ -212,3 +221,11 @@ def _first_positive(*values: Optional[float]) -> Optional[float]:
         if v is not None and v > 0:
             return float(v)
     return None
+
+
+def _build_market_url(event_ticker: Optional[str], market_id: str) -> str:
+    # Kalshi's web app is event-centric. Linking to the event page is more
+    # reliable than linking to the raw market ticker route, which may not
+    # resolve for all contract sub-markets.
+    target = event_ticker or market_id
+    return f"https://kalshi.com/markets/{quote(target, safe='')}"

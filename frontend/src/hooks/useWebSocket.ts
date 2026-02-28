@@ -1,8 +1,17 @@
 import { useEffect, useRef, useState, useCallback } from "react";
-import type { Opportunity, Portfolio, VenueStatusMap, WsUpdatePayload } from "../types";
+import type {
+  Opportunity,
+  OrderAnomaly,
+  PipelineStatusMap,
+  Portfolio,
+  VenueStatusMap,
+  WsUpdatePayload,
+} from "../types";
 
 export interface LiveState {
   opportunities: Opportunity[];
+  anomalies: OrderAnomaly[];
+  pipelineStatus: PipelineStatusMap;
   venueStatus: VenueStatusMap;
   portfolio: Portfolio | null;
   connected: boolean;
@@ -26,9 +35,30 @@ const DEFAULT_VENUE_STATUS: VenueStatusMap = {
   },
 };
 
+const DEFAULT_PIPELINE_STATUS: PipelineStatusMap = {
+  arbitrage: {
+    enabled: true,
+    running: false,
+    last_update: null,
+    last_duration_ms: null,
+    item_count: 0,
+    error: null,
+  },
+  aberrant_orders: {
+    enabled: true,
+    running: false,
+    last_update: null,
+    last_duration_ms: null,
+    item_count: 0,
+    error: null,
+  },
+};
+
 export function useWebSocket(): LiveState {
   const [state, setState] = useState<LiveState>({
     opportunities: [],
+    anomalies: [],
+    pipelineStatus: DEFAULT_PIPELINE_STATUS,
     venueStatus: DEFAULT_VENUE_STATUS,
     portfolio: null,
     connected: false,
@@ -59,6 +89,8 @@ export function useWebSocket(): LiveState {
         if (msg.type === "update") {
           setState({
             opportunities: msg.data.opportunities,
+            anomalies: msg.data.anomalies,
+            pipelineStatus: msg.data.pipeline_status,
             venueStatus: msg.data.venue_status,
             portfolio: msg.data.portfolio,
             connected: true,

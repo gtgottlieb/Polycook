@@ -7,13 +7,27 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
-from models import NormalizedContract, Opportunity
+from models import (
+    NormalizedContract,
+    Opportunity,
+    OrderAnomaly,
+    PipelineStatus,
+    PipelineStatusMap,
+)
 
 
 @dataclass
 class AppState:
     opportunities: list[Opportunity] = field(default_factory=list)
     contracts: list[NormalizedContract] = field(default_factory=list)
+    anomalies: list[OrderAnomaly] = field(default_factory=list)
+    anomaly_snapshot: dict[str, Any] = field(default_factory=dict)
+    pipeline_status: PipelineStatusMap = field(
+        default_factory=lambda: PipelineStatusMap(
+            arbitrage=PipelineStatus(enabled=True, running=False),
+            aberrant_orders=PipelineStatus(enabled=True, running=False),
+        )
+    )
 
     @property
     def contracts_by_token(self) -> dict[str, NormalizedContract]:

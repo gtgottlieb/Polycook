@@ -1,16 +1,14 @@
-"""
+﻿"""
 Polymarket API client.
 
 Strategy:
   1. negRisk events  - fetch ALL active negRisk events from Gamma /events.
      Each event groups mutually-exclusive binary markets (e.g. "Who wins the
      Stanley Cup?").  We extract the YES token from every market in the event
-     and check Σ ask(YES_i) < 1.0 for event-group arb.
+     and check Î£ ask(YES_i) < 1.0 for event-group arb.
 
-  2. Binary markets  - small set of the *least-competitive* binary markets
-     (competitive score ascending) where intra-market arb is theoretically
-     possible (ask_YES + ask_NO < 1.0).  High-volume markets are always
-     efficiently priced at ~1.001 so we skip them.
+  2. Binary markets  - fetch all active YES/NO binary markets sorted by
+     competitive score and evaluate intra-market/cross-venue opportunities.
 
 Both passes fetch CLOB order books concurrently for accurate bid/ask/sizes.
 """
@@ -22,6 +20,7 @@ import logging
 import re
 from datetime import datetime
 from typing import Optional
+from urllib.parse import quote
 
 import aiohttp
 
@@ -37,8 +36,8 @@ _venue_status = VenueStatus(
     market_count=0,
 )
 
-# Hard cap on binary markets to scan (they rarely have arb; save CLOB budget)
-_BINARY_MARKET_CAP = 100
+_metadata_cache: list[NormalizedContract] = []
+_metadata_refreshed_at: Optional[datetime] = None
 _TEMPORAL_LADDER_SPLIT_RE = re.compile(
     r"\b(on or before|at or before|before|by)\b",
     re.IGNORECASE,
@@ -54,18 +53,39 @@ async def fetch_markets() -> list[NormalizedContract]:
     Main entry point. Returns a flat list of NormalizedContract, one per
     outcome token, combining negRisk event YES-legs and binary market legs.
     """
-    global _venue_status
+    global _venue_status, _metadata_cache, _metadata_refreshed_at
     try:
         async with aiohttp.ClientSession(
             timeout=aiohttp.ClientTimeout(total=30)
         ) as session:
-            # Fetch both sources concurrently
-            event_task = asyncio.create_task(_fetch_neg_risk_event_contracts(session))
-            binary_task = asyncio.create_task(_fetch_binary_market_contracts(session))
-            event_contracts, binary_contracts = await asyncio.gather(event_task, binary_task)
+            now = datetime.utcnow()
+            refresh_needed = (
+                _metadata_refreshed_at is None
+                or not _metadata_cache
+                or (now - _metadata_refreshed_at).total_seconds() >= settings.metadata_refresh_interval_s
+            )
 
-            all_contracts = event_contracts + binary_contracts
-            if not all_contracts:
+            if refresh_needed:
+                event_task = asyncio.create_task(_fetch_neg_risk_event_contracts(session))
+                binary_task = asyncio.create_task(_fetch_binary_market_contracts(session))
+                event_contracts, binary_contracts = await asyncio.gather(event_task, binary_task)
+                _metadata_cache = event_contracts + binary_contracts
+                _metadata_refreshed_at = now
+                logger.info(
+                    "Metadata refresh complete: %d contracts (events=%d, binary=%d)",
+                    len(_metadata_cache),
+                    len(event_contracts),
+                    len(binary_contracts),
+                )
+            else:
+                cache_age = (now - _metadata_refreshed_at).total_seconds() if _metadata_refreshed_at else 0.0
+                logger.info(
+                    "Metadata cache hit: %d contracts (age=%.1fs)",
+                    len(_metadata_cache),
+                    cache_age,
+                )
+
+            if not _metadata_cache:
                 _venue_status = VenueStatus(
                     connected=True,
                     last_update=datetime.utcnow(),
@@ -74,21 +94,26 @@ async def fetch_markets() -> list[NormalizedContract]:
                 )
                 return []
 
-            token_ids = [c.outcome_id for c in all_contracts]
+            all_contracts = [c.model_copy() for c in _metadata_cache]
+            token_ids = list(dict.fromkeys(c.outcome_id for c in all_contracts))
             books = await _fetch_order_books(session, token_ids)
             all_contracts = _apply_order_books(all_contracts, books)
 
-        now = datetime.utcnow()
+        snapshot_time = datetime.utcnow()
         event_ids = {c.event_id for c in all_contracts if c.event_id}
         market_ids = {c.market_id for c in all_contracts if not c.event_id}
+        event_contract_count = sum(1 for c in all_contracts if c.event_id)
+        binary_contract_count = len(all_contracts) - event_contract_count
         logger.info(
             "Fetch complete: %d event-group contracts (%d events) + %d binary contracts (%d markets)",
-            len(event_contracts), len(event_ids),
-            len(binary_contracts), len(market_ids),
+            event_contract_count,
+            len(event_ids),
+            binary_contract_count,
+            len(market_ids),
         )
         _venue_status = VenueStatus(
             connected=True,
-            last_update=now,
+            last_update=snapshot_time,
             stale=False,
             market_count=len(event_ids) + len(market_ids),
         )
@@ -106,7 +131,7 @@ async def fetch_markets() -> list[NormalizedContract]:
         return []
 
 
-# ─── negRisk event pipeline ────────────────────────────────────────────────────
+# â”€â”€â”€ negRisk event pipeline â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 async def _fetch_neg_risk_event_contracts(
     session: aiohttp.ClientSession,
@@ -115,7 +140,7 @@ async def _fetch_neg_risk_event_contracts(
     raw_events = await _fetch_gamma_events(session)
     contracts = _parse_neg_risk_events(raw_events)
     logger.info(
-        "negRisk pipeline: %d events → %d YES-token contracts",
+        "negRisk pipeline: %d events â†’ %d YES-token contracts",
         len(raw_events), len(contracts),
     )
     return contracts
@@ -157,7 +182,7 @@ def _parse_neg_risk_events(raw_events: list[dict]) -> list[NormalizedContract]:
     and return one NormalizedContract per YES token.
 
     In Polymarket negRisk events:
-      - outcomes[0] = "Yes"  → clobTokenIds[0] = YES token ID
+      - outcomes[0] = "Yes"  â†’ clobTokenIds[0] = YES token ID
       - All markets are mutually exclusive; exactly one resolves to $1
     """
     now = datetime.utcnow()
@@ -206,6 +231,7 @@ def _parse_neg_risk_events(raw_events: list[dict]) -> list[NormalizedContract]:
                 continue
 
             market_title = m.get("question") or m.get("title") or event_title
+            market_url = _build_market_url(m)
 
             end_date_raw = m.get("endDate") or m.get("end_date_iso") or m.get("endDateIso")
             close_time: Optional[datetime] = None
@@ -241,6 +267,7 @@ def _parse_neg_risk_events(raw_events: list[dict]) -> list[NormalizedContract]:
                     close_time=close_time,
                     updated_at=now,
                     market_title=market_title,
+                    market_url=market_url,
                     event_id=event_id,
                     event_title=event_title,
                 )
@@ -281,19 +308,19 @@ def _extract_temporal_stem(question: str) -> Optional[str]:
     return stem or None
 
 
-# ─── Binary market pipeline ────────────────────────────────────────────────────
+# â”€â”€â”€ Binary market pipeline â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 async def _fetch_binary_market_contracts(
     session: aiohttp.ClientSession,
 ) -> list[NormalizedContract]:
     """
-    Fetch the least-competitive binary markets (most likely to be mis-priced)
-    and return YES+NO contracts for intra-market arb detection.
+    Fetch all active binary markets and return YES+NO contracts for
+    intra-market and cross-venue arb detection.
     """
     raw_markets = await _fetch_gamma_markets_binary(session)
     contracts = _parse_gamma_markets(raw_markets)
     logger.info(
-        "Binary pipeline: %d markets → %d contracts",
+        "Binary pipeline: %d markets â†’ %d contracts",
         len(raw_markets), len(contracts),
     )
     return contracts
@@ -301,15 +328,13 @@ async def _fetch_binary_market_contracts(
 
 async def _fetch_gamma_markets_binary(session: aiohttp.ClientSession) -> list[dict]:
     """
-    Fetch binary markets sorted by competitive score ascending (least
-    efficient / most mis-priced markets first) up to _BINARY_MARKET_CAP.
+    Fetch all active binary markets sorted by competitive score ascending.
     """
     markets: list[dict] = []
     limit = 100
     offset = 0
-    target = min(_BINARY_MARKET_CAP, settings.max_markets)
 
-    while len(markets) < target:
+    while True:
         url = (
             f"{settings.gamma_base_url}/markets"
             f"?active=true&closed=false&limit={limit}&offset={offset}"
@@ -324,12 +349,26 @@ async def _fetch_gamma_markets_binary(session: aiohttp.ClientSession) -> list[di
         if not data:
             break
 
-        markets.extend(data)
+        yes_no_page = [m for m in data if _is_yes_no_market(m)]
+        markets.extend(yes_no_page)
         if len(data) < limit:
             break
         offset += limit
 
-    return markets[:target]
+    return markets
+
+
+def _is_yes_no_market(market: dict) -> bool:
+    outcomes_raw = market.get("outcomes")
+    outcomes = (
+        json.loads(outcomes_raw)
+        if isinstance(outcomes_raw, str)
+        else (outcomes_raw or [])
+    )
+    if not isinstance(outcomes, list) or len(outcomes) != 2:
+        return False
+    labels = {str(x).strip().lower() for x in outcomes}
+    return labels == {"yes", "no"}
 
 
 def _parse_gamma_markets(raw: list[dict]) -> list[NormalizedContract]:
@@ -346,6 +385,7 @@ def _parse_gamma_markets(raw: list[dict]) -> list[NormalizedContract]:
             continue
 
         title = m.get("question") or m.get("title") or "Unknown Market"
+        market_url = _build_market_url(m)
         end_date_raw = m.get("endDate") or m.get("end_date_iso") or m.get("endDateIso")
         close_time: Optional[datetime] = None
         if end_date_raw:
@@ -396,56 +436,138 @@ def _parse_gamma_markets(raw: list[dict]) -> list[NormalizedContract]:
                     close_time=close_time,
                     updated_at=now,
                     market_title=title,
-                    # event_id intentionally None — these are standalone binary markets
+                    market_url=market_url,
+                    # event_id intentionally None â€” these are standalone binary markets
                 )
             )
 
     return contracts
 
 
-# ─── CLOB order books ─────────────────────────────────────────────────────────
+# â”€â”€â”€ CLOB order books â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 async def _fetch_order_books(
     session: aiohttp.ClientSession,
     token_ids: list[str],
 ) -> dict[str, dict]:
     """
-    Fetch order books concurrently. Returns map token_id → price/size data.
-
-    CLOB sort order quirk: bids ascending (best bid = bids[-1]),
-    asks descending (best ask = asks[-1]).
+    Fetch order books using CLOB /books batched POSTs with single-token
+    fallback for misses. Returns map token_id -> price/size data.
     """
-    sem = asyncio.Semaphore(50)
+    if not token_ids:
+        return {}
 
-    async def fetch_one(token_id: str) -> tuple[str, dict | None]:
-        url = f"{settings.clob_base_url}/book?token_id={token_id}"
-        async with sem:
+    batch_size = max(25, min(1000, settings.clob_books_batch_size))
+    batch_sem = asyncio.Semaphore(8)
+    batch_url = f"{settings.clob_base_url}/books"
+
+    async def fetch_batch(batch_ids: list[str]) -> dict[str, dict]:
+        payload = [{"token_id": tid} for tid in batch_ids]
+        results: dict[str, dict] = {}
+
+        async with batch_sem:
             try:
-                async with session.get(url) as resp:
+                async with session.post(batch_url, json=payload) as resp:
                     if resp.status != 200:
-                        return token_id, None
-                    book = await resp.json(content_type=None)
-                    bids = book.get("bids") or []
-                    asks = book.get("asks") or []
-                    return token_id, {
-                        "best_bid": float(bids[-1]["price"]) if bids else None,
-                        "bid_size": float(bids[-1]["size"]) if bids else None,
-                        "best_ask": float(asks[-1]["price"]) if asks else None,
-                        "ask_size": float(asks[-1]["size"]) if asks else None,
-                    }
-            except Exception as exc:
-                logger.debug("CLOB /book error for %s: %s", token_id[:12], exc)
-                return token_id, None
+                        return {}
+                    data = await resp.json(content_type=None)
+            except Exception:
+                return {}
 
-    results_list = await asyncio.gather(*[fetch_one(tid) for tid in token_ids])
+        if not isinstance(data, list):
+            return {}
+
+        for raw in data:
+            if not isinstance(raw, dict):
+                continue
+            token_id = str(raw.get("asset_id") or raw.get("token_id") or "")
+            if not token_id:
+                continue
+            parsed = _parse_book_snapshot(raw)
+            if parsed is not None:
+                results[token_id] = parsed
+
+        return results
+
+    chunks = [token_ids[i:i + batch_size] for i in range(0, len(token_ids), batch_size)]
+    chunk_results = await asyncio.gather(*[fetch_batch(chunk) for chunk in chunks])
+
     results: dict[str, dict] = {}
-    for token_id, data in results_list:
-        if data is not None:
-            results[token_id] = data
+    for item in chunk_results:
+        results.update(item)
+
+    missing_ids = [tid for tid in token_ids if tid not in results]
+    if missing_ids:
+        # Keep fallback bounded so a partially-throttled batch call does not
+        # stall an entire cycle on thousands of single-token requests.
+        fallback_ids = missing_ids[:400]
+        fallback_results = await asyncio.gather(*[
+            _fetch_single_book(session, tid) for tid in fallback_ids
+        ])
+        for token_id, data in zip(fallback_ids, fallback_results):
+            if data is not None:
+                results[token_id] = data
 
     logger.info("CLOB books fetched: %d/%d tokens got prices", len(results), len(token_ids))
     return results
 
+
+async def _fetch_single_book(
+    session: aiohttp.ClientSession,
+    token_id: str,
+) -> Optional[dict]:
+    url = f"{settings.clob_base_url}/book?token_id={token_id}"
+    try:
+        async with session.get(url) as resp:
+            if resp.status != 200:
+                return None
+            book = await resp.json(content_type=None)
+            return _parse_book_snapshot(book)
+    except Exception as exc:
+        logger.debug("CLOB /book error for %s: %s", token_id[:12], exc)
+        return None
+
+
+def _parse_book_snapshot(book: dict) -> Optional[dict]:
+    bids = book.get("bids") or []
+    asks = book.get("asks") or []
+    best_bid, bid_size = _best_level(bids, side="bid")
+    best_ask, ask_size = _best_level(asks, side="ask")
+
+    if best_bid is None and best_ask is None:
+        return None
+
+    return {
+        "best_bid": best_bid,
+        "bid_size": bid_size,
+        "best_ask": best_ask,
+        "ask_size": ask_size,
+    }
+
+
+def _best_level(levels: list, side: str) -> tuple[Optional[float], Optional[float]]:
+    best_price: Optional[float] = None
+    best_size: Optional[float] = None
+
+    for level in levels:
+        if not isinstance(level, dict):
+            continue
+        try:
+            price = float(level.get("price"))
+            size = float(level.get("size"))
+        except (TypeError, ValueError):
+            continue
+
+        if side == "bid":
+            better = best_price is None or price > best_price
+        else:
+            better = best_price is None or price < best_price
+
+        if better:
+            best_price = price
+            best_size = size
+
+    return best_price, best_size
 
 def _apply_order_books(
     contracts: list[NormalizedContract],
@@ -484,3 +606,34 @@ def mark_stale(
         age = (now - c.updated_at).total_seconds()
         result.append(c.model_copy(update={"is_stale": age > stale_threshold_s}))
     return result
+
+
+def _build_market_url(market: dict) -> Optional[str]:
+    market_slug = market.get("market_slug") or market.get("slug")
+
+    events = market.get("events") or []
+    event_slug: Optional[str] = None
+    if isinstance(events, list):
+        for event in events:
+            if not isinstance(event, dict):
+                continue
+            raw_event_slug = event.get("slug") or event.get("event_slug")
+            if raw_event_slug:
+                event_slug = str(raw_event_slug)
+                break
+
+    if market_slug:
+        market_slug = str(market_slug)
+        if event_slug and event_slug != market_slug:
+            return (
+                "https://polymarket.com/event/"
+                f"{quote(event_slug, safe='')}/{quote(market_slug, safe='')}"
+            )
+        return f"https://polymarket.com/market/{quote(market_slug, safe='')}"
+
+    if event_slug:
+        return f"https://polymarket.com/event/{quote(event_slug, safe='')}"
+
+    return None
+
+

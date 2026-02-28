@@ -59,6 +59,16 @@ export default function TradeModal({ opportunity, onClose, onSuccess }: Props) {
                 <p className="text-slate-300 mt-0.5 truncate" title={leg.market_title}>
                   {leg.market_title}
                 </p>
+                {leg.market_url && (
+                  <a
+                    href={leg.market_url}
+                    target="_blank"
+                    rel="noreferrer"
+                    className="mt-0.5 inline-block text-[11px] text-accent-blue hover:underline"
+                  >
+                    Open market
+                  </a>
+                )}
               </div>
             ))}
             <div className="border-t border-surface-3 pt-1 mt-1 flex justify-between text-xs font-medium">

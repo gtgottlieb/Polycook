@@ -22,8 +22,8 @@ import hashlib
 import logging
 import re
 from dataclasses import dataclass
+from difflib import SequenceMatcher
 from datetime import datetime
-from itertools import combinations
 from typing import Optional
 
 from config import settings
@@ -52,6 +52,13 @@ _TITLE_STOPWORDS = {
     "will",
     "with",
 }
+_CROSS_MIN_SHARED_TOKENS = 2
+_CROSS_MIN_SHORT_SHARED_TOKENS = 1
+_CROSS_MIN_FAST_SCORE = 0.34
+_CROSS_MIN_TEXT_SIMILARITY = 0.58
+_CROSS_MAX_CLOSE_GAP_S = 30 * 24 * 3600
+_CROSS_MAX_CANDIDATES_PER_MARKET = 12
+_CROSS_SEED_TOKEN_LIMIT = 3
 
 
 @dataclass(frozen=True)
@@ -64,72 +71,80 @@ class _BinaryMarket:
     no: NormalizedContract
     canonical_title: str
     tokens: set[str]
+    anchor_tokens: tuple[str, ...]
+    numeric_tokens: frozenset[str]
 
 
 def detect_opportunities(
     contracts: list[NormalizedContract],
     min_edge_pct: Optional[float] = None,
+    min_max_size: Optional[float] = None,
 ) -> list[Opportunity]:
     """
     Run all detection passes and return opportunities sorted by edge descending.
     """
     if min_edge_pct is None:
         min_edge_pct = settings.min_edge_pct
+    if min_max_size is None:
+        min_max_size = settings.min_max_size
 
     opportunities: list[Opportunity] = []
-    near_misses: list[tuple[float, str, str]] = []  # (edge, title, reason)
 
     # Pass 1: event-group arb (negRisk YES tokens grouped by event_id)
     event_contracts = [c for c in contracts if c.event_id]
     grouped_events = _group_by_event(event_contracts)
     for event_id, legs in grouped_events.items():
-        opp, miss = _check_group(
+        opp, _ = _check_group(
             group_id=event_id,
             contracts=legs,
             min_edge_pct=min_edge_pct,
+            min_max_size=min_max_size,
             opp_type="event",
             title=legs[0].event_title or event_id,
         )
         if opp:
             opportunities.append(opp)
-        elif miss:
-            near_misses.append(miss)
 
     # Pass 2: intra-market arb (binary YES+NO grouped by market_id)
     binary_contracts = [c for c in contracts if not c.event_id]
     grouped_markets = _group_by_market(binary_contracts)
     for market_id, legs in grouped_markets.items():
-        opp, miss = _check_group(
+        opp, _ = _check_group(
             group_id=market_id,
             contracts=legs,
             min_edge_pct=min_edge_pct,
+            min_max_size=min_max_size,
             opp_type="intra",
             title=legs[0].market_title if legs else market_id,
         )
         if opp:
             opportunities.append(opp)
-        elif miss:
-            near_misses.append(miss)
 
     # Pass 3: cross-venue binary arb (buy YES on one venue, NO on the other)
-    cross_opps, cross_misses, cross_pair_count = _detect_cross_venue(
+    cross_opps, cross_pair_count = _detect_cross_venue(
         binary_contracts,
         min_edge_pct=min_edge_pct,
+        min_max_size=min_max_size,
     )
     opportunities.extend(cross_opps)
-    near_misses.extend(cross_misses)
 
     opportunities.sort(key=lambda o: o.edge_pct, reverse=True)
 
-    # Log top near-misses (helps calibrate threshold and spot almost-arbs)
-    near_misses.sort(key=lambda x: x[0], reverse=True)
-    if near_misses:
-        logger.info(
-            "Top near-arb groups (below %.2f%% threshold):",
-            min_edge_pct * 100,
-        )
-        for edge, title, reason in near_misses[:10]:
-            logger.info("  edge=%+.4f  %-55s  [%s]", edge, title[:55], reason)
+    if opportunities:
+        logger.info("Top opportunities:")
+        for rank, opp in enumerate(opportunities[:], start=1):
+            logger.info(
+                "  #%d edge=%+.4f size=%.2f type=%s legs=%d venues=%s title=%s",
+                rank,
+                opp.edge_pct,
+                opp.max_size,
+                opp.type,
+                len(opp.legs),
+                "/".join(opp.venues),
+                (opp.event_title or "")[:80],
+            )
+    else:
+        logger.info("Top opportunities: none")
 
     logger.info(
         "Detection: %d event groups + %d binary markets + %d cross-venue pairs scanned -> %d opportunities (min_edge=%.3f%%)",
@@ -165,6 +180,7 @@ def _check_group(
     group_id: str,
     contracts: list[NormalizedContract],
     min_edge_pct: float,
+    min_max_size: float,
     opp_type: str,
     title: str,
 ) -> tuple[Optional[Opportunity], Optional[tuple[float, str, str]]]:
@@ -172,8 +188,8 @@ def _check_group(
     Check whether a group of contracts (either a negRisk event's YES tokens
     or a binary market's YES+NO tokens) has an arb opportunity.
 
-    Returns (Opportunity, None) on success, (None, near_miss_tuple) when
-    skipped but close, or (None, None) when silently skipped.
+    Returns an Opportunity when valid and profitable, otherwise None.
+    The second tuple value is retained for internal diagnostics.
     """
     if len(contracts) < 2:
         return None, None
@@ -202,6 +218,8 @@ def _check_group(
     max_size = min(c.ask_size for c in contracts)  # type: ignore[arg-type]
     if max_size <= 0:
         return None, (edge_pct, title, "max_size=0")
+    if max_size < min_max_size:
+        return None, (edge_pct, title, f"max_size<{min_max_size:.2f}")
 
     if edge_pct < min_edge_pct:
         return None, (edge_pct, title, f"below threshold ({edge_pct*100:.3f}%)")
@@ -211,6 +229,7 @@ def _check_group(
             outcome_id=c.outcome_id,
             market_id=c.market_id,
             market_title=c.market_title,
+            market_url=c.market_url,
             label=c.label,
             venue=c.venue,
             ask=c.ask,
@@ -241,9 +260,9 @@ def _check_group(
 def _detect_cross_venue(
     contracts: list[NormalizedContract],
     min_edge_pct: float,
-) -> tuple[list[Opportunity], list[tuple[float, str, str]], int]:
+    min_max_size: float,
+) -> tuple[list[Opportunity], int]:
     opportunities: list[Opportunity] = []
-    near_misses: list[tuple[float, str, str]] = []
 
     markets = _build_binary_markets(contracts)
     matched_pairs = _match_cross_venue_pairs(markets)
@@ -252,18 +271,17 @@ def _detect_cross_venue(
         display_title = _cross_display_title(left.title, right.title)
 
         for left_leg, right_leg in ((left.yes, right.no), (left.no, right.yes)):
-            opp, miss = _check_cross_pair(
+            opp, _ = _check_cross_pair(
                 left_leg=left_leg,
                 right_leg=right_leg,
                 title=display_title,
                 min_edge_pct=min_edge_pct,
+                min_max_size=min_max_size,
             )
             if opp:
                 opportunities.append(opp)
-            elif miss:
-                near_misses.append(miss)
 
-    return opportunities, near_misses, len(matched_pairs)
+    return opportunities, len(matched_pairs)
 
 
 def _check_cross_pair(
@@ -271,6 +289,7 @@ def _check_cross_pair(
     right_leg: NormalizedContract,
     title: str,
     min_edge_pct: float,
+    min_max_size: float,
 ) -> tuple[Optional[Opportunity], Optional[tuple[float, str, str]]]:
     if left_leg.venue == right_leg.venue:
         return None, None
@@ -302,6 +321,8 @@ def _check_cross_pair(
 
     if max_size <= 0:
         return None, (edge_pct, title, "cross max_size=0")
+    if max_size < min_max_size:
+        return None, (edge_pct, title, f"cross max_size<{min_max_size:.2f}")
 
     if edge_pct < min_edge_pct:
         return None, (
@@ -315,6 +336,7 @@ def _check_cross_pair(
             outcome_id=left_leg.outcome_id,
             market_id=left_leg.market_id,
             market_title=left_leg.market_title,
+            market_url=left_leg.market_url,
             label=left_leg.label,
             venue=left_leg.venue,
             ask=left_leg.ask,
@@ -325,6 +347,7 @@ def _check_cross_pair(
             outcome_id=right_leg.outcome_id,
             market_id=right_leg.market_id,
             market_title=right_leg.market_title,
+            market_url=right_leg.market_url,
             label=right_leg.label,
             venue=right_leg.venue,
             ask=right_leg.ask,
@@ -373,15 +396,24 @@ def _build_binary_markets(contracts: list[NormalizedContract]) -> list[_BinaryMa
             continue
 
         title = yes.market_title or no.market_title
-        canonical = _canonicalize_title(title)
-        tokens = _title_tokens(title)
-        if not canonical or len(tokens) < 3:
+        ordered_tokens = _ordered_title_tokens(title)
+        canonical = " ".join(ordered_tokens)
+        tokens = set(ordered_tokens)
+        if not canonical or len(tokens) < 2:
+            continue
+        anchor_tokens = _anchor_tokens(tokens)
+        numeric_tokens = frozenset(t for t in tokens if _token_has_digits(t))
+        if (
+            _leg_executable_size(yes) < settings.min_max_size
+            and _leg_executable_size(no) < settings.min_max_size
+        ):
             continue
 
         close_time = min(
             (t for t in (yes.close_time, no.close_time) if t),
             default=None,
         )
+
 
         markets.append(
             _BinaryMarket(
@@ -393,6 +425,8 @@ def _build_binary_markets(contracts: list[NormalizedContract]) -> list[_BinaryMa
                 no=no,
                 canonical_title=canonical,
                 tokens=tokens,
+                anchor_tokens=anchor_tokens,
+                numeric_tokens=numeric_tokens,
             )
         )
 
@@ -402,32 +436,77 @@ def _build_binary_markets(contracts: list[NormalizedContract]) -> list[_BinaryMa
 def _match_cross_venue_pairs(
     markets: list[_BinaryMarket],
 ) -> list[tuple[_BinaryMarket, _BinaryMarket, float]]:
-    candidates: list[tuple[float, _BinaryMarket, _BinaryMarket]] = []
-    for left, right in combinations(markets, 2):
-        if left.venue == right.venue:
-            continue
-        score = _cross_match_score(left, right)
-        if score is None:
-            continue
-        candidates.append((score, left, right))
+    by_venue: dict[str, list[_BinaryMarket]] = {}
+    for m in markets:
+        by_venue.setdefault(m.venue, []).append(m)
 
-    candidates.sort(
-        key=lambda x: (x[0], x[1].market_id, x[2].market_id),
+    venue_names = sorted(by_venue.keys())
+    if len(venue_names) < 2:
+        return []
+
+    all_pairs: list[tuple[_BinaryMarket, _BinaryMarket, float]] = []
+    for i, left_venue in enumerate(venue_names):
+        for right_venue in venue_names[i + 1:]:
+            left_markets = by_venue[left_venue]
+            right_markets = by_venue[right_venue]
+            all_pairs.extend(_match_venue_pair(left_markets, right_markets))
+
+    all_pairs.sort(
+        key=lambda x: (x[2], x[0].market_id, x[1].market_id),
         reverse=True,
     )
+    return all_pairs
 
-    selected: list[tuple[_BinaryMarket, _BinaryMarket, float]] = []
-    used_market_keys: set[str] = set()
-    for score, left, right in candidates:
-        left_key = f"{left.venue}:{left.market_id}"
-        right_key = f"{right.venue}:{right.market_id}"
-        if left_key in used_market_keys or right_key in used_market_keys:
-            continue
-        used_market_keys.add(left_key)
-        used_market_keys.add(right_key)
-        selected.append((left, right, score))
 
-    return selected
+def _match_venue_pair(
+    left_markets: list[_BinaryMarket],
+    right_markets: list[_BinaryMarket],
+) -> list[tuple[_BinaryMarket, _BinaryMarket, float]]:
+    # Build sparse indices once and only run expensive text scoring on a
+    # tightly-pruned candidate set per left market.
+    exact_title_to_right_idxs: dict[str, list[int]] = {}
+    token_to_right_idxs: dict[str, list[int]] = {}
+    for idx, market in enumerate(right_markets):
+        exact_title_to_right_idxs.setdefault(market.canonical_title, []).append(idx)
+        for token in market.tokens:
+            token_to_right_idxs.setdefault(token, []).append(idx)
+
+    max_posting_size = max(24, len(right_markets) // 6)
+    matches: list[tuple[_BinaryMarket, _BinaryMarket, float]] = []
+    for left in left_markets:
+        exact_matches = exact_title_to_right_idxs.get(left.canonical_title)
+        if exact_matches:
+            ranked_candidate_idxs = exact_matches[:]
+        else:
+            candidate_counts: dict[int, int] = {}
+            for token in _seed_tokens(left, token_to_right_idxs, max_posting_size):
+                for idx in token_to_right_idxs.get(token, []):
+                    candidate_counts[idx] = candidate_counts.get(idx, 0) + 1
+
+            if not candidate_counts:
+                continue
+
+            ranked_candidate_idxs = [
+                idx
+                for idx, _count in sorted(
+                    candidate_counts.items(),
+                    key=lambda item: (
+                        item[1],
+                        _candidate_rank(left, right_markets[item[0]]),
+                        right_markets[item[0]].market_id,
+                    ),
+                    reverse=True,
+                )[:_CROSS_MAX_CANDIDATES_PER_MARKET]
+            ]
+
+        for idx in ranked_candidate_idxs:
+            right = right_markets[idx]
+            score = _cross_match_score(left, right)
+            if score is None:
+                continue
+            matches.append((left, right, score))
+
+    return _select_best_disjoint_matches(matches)
 
 
 def _cross_match_score(left: _BinaryMarket, right: _BinaryMarket) -> Optional[float]:
@@ -435,22 +514,46 @@ def _cross_match_score(left: _BinaryMarket, right: _BinaryMarket) -> Optional[fl
         base_score = 1.0
     else:
         overlap = left.tokens & right.tokens
-        if len(overlap) < 4:
+        min_shared = (
+            _CROSS_MIN_SHORT_SHARED_TOKENS
+            if min(len(left.tokens), len(right.tokens)) <= 2
+            else _CROSS_MIN_SHARED_TOKENS
+        )
+        if len(overlap) < min_shared:
             return None
+        if left.numeric_tokens and right.numeric_tokens and not (left.numeric_tokens & right.numeric_tokens):
+            return None
+
         union = left.tokens | right.tokens
         if not union:
             return None
         jaccard = len(overlap) / len(union)
-        if jaccard < 0.72:
+        overlap_ratio = len(overlap) / max(len(left.tokens), len(right.tokens))
+        anchor_overlap = len(set(left.anchor_tokens) & set(right.anchor_tokens))
+        fast_score = max(
+            jaccard,
+            overlap_ratio,
+            min(1.0, (anchor_overlap * 0.20) + overlap_ratio),
+        )
+        if fast_score < _CROSS_MIN_FAST_SCORE:
             return None
-        base_score = jaccard
+
+        similarity = SequenceMatcher(
+            None,
+            left.canonical_title,
+            right.canonical_title,
+        ).ratio()
+
+        if similarity < _CROSS_MIN_TEXT_SIMILARITY:
+            return None
+        base_score = max(fast_score, similarity)
 
     if left.close_time and right.close_time:
         gap_seconds = abs((left.close_time - right.close_time).total_seconds())
-        if gap_seconds > 2 * 24 * 3600:
+        if gap_seconds > _CROSS_MAX_CLOSE_GAP_S:
             return None
-        # Small bonus for close expiries, keeps tie-breaking deterministic.
-        base_score += max(0.0, 0.02 - (gap_seconds / (2 * 24 * 3600)) * 0.02)
+        # Keep nearer expiries ranked slightly higher.
+        base_score += max(0.0, 0.05 - (gap_seconds / _CROSS_MAX_CLOSE_GAP_S) * 0.05)
 
     return base_score
 
@@ -470,10 +573,98 @@ def _is_no_label(label: str) -> bool:
 
 
 def _canonicalize_title(title: str) -> str:
-    tokens = [t for t in _TITLE_TOKEN_RE.findall(title.lower()) if t not in _TITLE_STOPWORDS]
-    return " ".join(tokens)
+    return " ".join(_ordered_title_tokens(title))
 
 
 def _title_tokens(title: str) -> set[str]:
-    return {t for t in _TITLE_TOKEN_RE.findall(title.lower()) if t not in _TITLE_STOPWORDS}
+    return set(_ordered_title_tokens(title))
 
+
+def _ordered_title_tokens(title: str) -> list[str]:
+    return [t for t in _TITLE_TOKEN_RE.findall(title.lower()) if t not in _TITLE_STOPWORDS]
+
+
+def _anchor_tokens(tokens: set[str]) -> tuple[str, ...]:
+    return tuple(
+        sorted(tokens, key=_token_sort_key, reverse=True)[:_CROSS_SEED_TOKEN_LIMIT]
+    )
+
+
+def _token_sort_key(token: str) -> tuple[int, int, str]:
+    return (1 if _token_has_digits(token) else 0, len(token), token)
+
+
+def _token_has_digits(token: str) -> bool:
+    return any(ch.isdigit() for ch in token)
+
+
+def _seed_tokens(
+    market: _BinaryMarket,
+    token_to_right_idxs: dict[str, list[int]],
+    max_posting_size: int,
+) -> list[str]:
+    ranked_tokens = list(market.anchor_tokens)
+    if len(ranked_tokens) < _CROSS_SEED_TOKEN_LIMIT:
+        for token in sorted(market.tokens, key=_token_sort_key, reverse=True):
+            if token not in ranked_tokens:
+                ranked_tokens.append(token)
+            if len(ranked_tokens) >= _CROSS_SEED_TOKEN_LIMIT:
+                break
+
+    seeded = [
+        token
+        for token in ranked_tokens
+        if 0 < len(token_to_right_idxs.get(token, ())) <= max_posting_size
+    ]
+    seeded.sort(
+        key=lambda token: (
+            len(token_to_right_idxs.get(token, ())),
+            -(1 if _token_has_digits(token) else 0),
+            -len(token),
+            token,
+        )
+    )
+    return seeded[:_CROSS_SEED_TOKEN_LIMIT]
+
+
+def _candidate_rank(left: _BinaryMarket, right: _BinaryMarket) -> tuple[int, float]:
+    overlap = len(left.tokens & right.tokens)
+    anchor_overlap = len(set(left.anchor_tokens) & set(right.anchor_tokens))
+    return (anchor_overlap, overlap / max(len(left.tokens), len(right.tokens)))
+
+
+def _select_best_disjoint_matches(
+    matches: list[tuple[_BinaryMarket, _BinaryMarket, float]],
+) -> list[tuple[_BinaryMarket, _BinaryMarket, float]]:
+    matches.sort(
+        key=lambda x: (
+            x[2],
+            x[0].canonical_title == x[1].canonical_title,
+            x[0].market_id,
+            x[1].market_id,
+        ),
+        reverse=True,
+    )
+
+    used_left: set[tuple[str, str]] = set()
+    used_right: set[tuple[str, str]] = set()
+    selected: list[tuple[_BinaryMarket, _BinaryMarket, float]] = []
+
+    for left, right, score in matches:
+        left_key = (left.venue, left.market_id)
+        right_key = (right.venue, right.market_id)
+        if left_key in used_left or right_key in used_right:
+            continue
+        used_left.add(left_key)
+        used_right.add(right_key)
+        selected.append((left, right, score))
+
+    return selected
+
+
+def _leg_executable_size(contract: NormalizedContract) -> float:
+    if contract.ask is None or contract.ask <= 0:
+        return 0.0
+    if contract.ask_size is None or contract.ask_size <= 0:
+        return 0.0
+    return contract.ask_size

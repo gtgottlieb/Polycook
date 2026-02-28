@@ -64,6 +64,16 @@ export default function OpportunityDetail({ opportunity, onTrade, onClose }: Pro
                   <p className="text-slate-300 mt-1 truncate" title={leg.market_title}>
                     {leg.market_title}
                   </p>
+                  {leg.market_url && (
+                    <a
+                      href={leg.market_url}
+                      target="_blank"
+                      rel="noreferrer"
+                      className="mt-1 inline-block text-[11px] text-accent-blue hover:underline"
+                    >
+                      Open market
+                    </a>
+                  )}
                 </div>
                 <div className="flex items-center gap-4 text-right">
                   <div>
